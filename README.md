@@ -1,17 +1,35 @@
-# Marketing Data Lake
+# Data Lake Engineering: Decisions & Trade-offs
 
-A personal project exploring the medallion architecture pattern (Bronze/Silver/Gold), applied to a marketing analytics use case on **Google BigQuery** and **Dataform**, with an eye toward making the Gold layer safely consumable by AI agents. Uses a synthetic dataset, not any employer's or client's real data or pipelines.
+A personal project documenting decisions and trade-offs from building a layered data platform on **Google BigQuery** and **Dataform** — the kind of reasoning that applies to any multi-source data lake feeding both BI and AI agents, not tool-specific trivia. Illustrated with a synthetic SaaS product-analytics scenario (product usage, subscription/billing, support tickets) and a synthetic dataset — not any employer's or client's real data, pipelines, or incidents.
+
+## Key Decisions & Problems Encountered
+
+**Choosing between a managed connector, a managed ELT tool, and a custom connector isn't a style preference — it's forced by failure mode**
+For a high-volume support/ticketing source, I tried two managed paths first. A hosted ELT connector kept failing mid-run on the load step into BigQuery once the table crossed a certain row-count threshold — the extraction side was fine, the batch insert wasn't. A native BigQuery connector for the same source didn't yet expose all the tables the model needed — some entities simply weren't in its supported set. Neither failure was a configuration mistake to fix; both were structural limits of the tool for that specific source at that specific volume. The fix was writing a small Python connector directly against the source's REST API, running serverless on a schedule (Cloud Run + Cloud Scheduler) — more code to own, but no black box between the API and BigQuery to debug when it silently stops. Lesson generalized: the more laborious path is sometimes the only reliable one, and that's a decision made per source, not a blanket policy.
+
+**Why the raw layer exists even though it "does nothing"**
+Bronze holds unmodified data, partitioned by ingestion date, with no transformations. It looks redundant until a downstream bug needs a full reprocess — replaying from Bronze is a BigQuery-internal operation; replaying from the source API means fighting whatever rate limits and history-retention window that API has. Bronze is insurance against the case where the source can't or won't hand you the same data twice.
+
+**Partition by ingestion date, not event date**
+Billing and support systems commonly amend historical records — a subscription charge gets prorated after the fact, a ticket gets recategorized days after it closed. If Bronze partitioned on event date, every one of those amendments would touch an already-closed partition. Partitioning on ingestion date instead keeps Bronze strictly append-only regardless of how much the source revises its own history; reconciling "what changed" becomes Silver's problem, not Bronze's.
+
+**An incremental lookback window is a bet, not a default**
+Silver and Gold models use a lookback window to reprocess recent history on every run, sized to cover the kind of delay that shows up in operational systems: processing lag, plus amendments that can backfill or correct a record days after it was first written. A window that's too short silently drops those late corrections. One that's too long makes every incremental run cost close to a full rebuild, for no accuracy gain past the point where amendments stop arriving. There's no universally correct window — it has to be sized against how late the specific source's corrections actually land, and revisited if that behavior changes.
+
+**A failed data-quality check blocks deployment; it doesn't just log a warning**
+Assertions that fail stop the Dataform run outright — nothing downstream of a failed table gets published. The alternative (publish with a warning) optimizes for uptime over correctness, which is backwards once a layer feeds an agent instead of just a dashboard: a person looking at a chart with a footnote can apply judgment, but an agent citing a stale or duplicated number states it as fact. A visibly missing answer is a smaller failure than a confidently wrong one.
+
+**Governance as a label on the table, not a separate permissions service**
+Every table carries a small set of BigQuery labels (`layer`, `source_system`, `agent_readable`, `domain`) instead of routing access decisions through a separate governance service. The trade-off is real: a label is declarative and lives right next to the schema it describes, cheap to audit by scanning table metadata — but it's enforced by convention (whatever reads the label has to respect it), not by the database engine the way row-level security would be. That's the right trade-off at the scale and trust level of a single internal data platform; it stops being the right trade-off once multiple untrusted consumers need the same data with different access rules.
 
 ## Architecture
 
 ```
 Raw Sources
     │
-    ├── Google Ads          (BigQuery Native Connector)
-    ├── Meta Ads            (Airbyte)
-    ├── GA4                 (BigQuery Native Export)
-    ├── Google Search Console (Airbyte)
-    └── CRM                 (Airbyte · PostgreSQL)
+    ├── Product usage events    (Native BigQuery export)
+    ├── Subscription & billing  (Native connector)
+    └── Support tickets         (Custom Python connector — see decisions above)
          │
          ▼
     ── BRONZE ──────────────────────────────────────────
@@ -23,69 +41,50 @@ Raw Sources
     ── SILVER ──────────────────────────────────────────
     Cleaned, deduplicated, typed.
     One model per source/entity.
-    Incremental with 7-day lookback window.
+    Incremental with a lookback window.
     agent_readable: true
          │
          ▼
     ── GOLD ────────────────────────────────────────────
     Business-ready aggregations.
-    Cross-channel unified performance model.
+    Unified per-account activity model.
     Optimized for dashboards and AI agents.
     agent_readable: true
 ```
-
-## Key Design Decisions
-
-**Incremental models with DELETE + INSERT**
-Silver and Gold models use a lookback window to handle late-arriving data without full table scans — sized to cover the kind of delay that shows up in real ad-platform reporting: processing lag plus reprocessing from server-side conversion APIs that can backfill a conversion against a session days after it happened. A window that's too short silently under-counts late conversions; one that's too long makes every incremental run cost close to a full rebuild for no accuracy gain.
-
-**Semantic labels on every table**
-Every table carries BigQuery labels (`layer`, `channel`, `agent_readable`, `pipeline`, `domain`) enabling automated governance and agent-safe data access policies.
-
-**Grounding by design**
-Gold tables are meant to feed a semantic layer consumed by AI agents. The `agent_readable: true` label is the grounding contract between the data layer and the agent layer — it ties every agent response to a verifiable, governed source instead of the model's parametric memory, which is the core defense against hallucination.
-
-**Connector-aware conventions**
-Different patterns for BigQuery Native connectors (Google Ads, GA4) vs Airbyte connectors — cost micros conversion, UNNEST for nested fields, `_airbyte_*` deduplication. Native connectors write directly to BigQuery with Google-managed schema evolution and no extra infrastructure, so they're the default whenever a channel has one. Airbyte only enters the picture for sources without a native BigQuery path — it costs a running connector and its own dedup logic that native connectors don't need.
 
 ## Project Structure
 
 ```
 definitions/
   02_silver/
-    gads/         # Google Ads Silver
-    ga4/          # GA4 Silver
-    meta/         # Meta Ads Silver
-    gsc/          # Google Search Console Silver
-    crm/          # CRM Silver
+    product/      # Product usage Silver
+    billing/       # Subscription & billing Silver
+    support/       # Support tickets Silver
   03_gold/
-    gads/         # Google Ads Gold
-    ga4/          # GA4 Gold
-    marketing/    # Unified cross-channel performance
+    account/       # Unified per-account activity
   assertions/
     02_silver/    # Data quality checks per source
-    03_gold/      # Cross-channel consistency checks
+    03_gold/      # Cross-source consistency checks
 _templates/
-  silver_channel_template.sqlx
-  gold_performance_template.sqlx
+  silver_source_template.sqlx
+  gold_account_template.sqlx
   assertion_no_duplicates_template.sqlx
 ```
 
-## Unified Performance Model
+## Unified Account Activity Model
 
-The `gld_marketing_performance_daily` table is the core output — a single model that consolidates all paid media channels:
+The `gld_account_activity_daily` table is the core output — a single model consolidating product usage, billing, and support signals per account:
 
 | Column | Description |
 |---|---|
 | `date` | Event date |
-| `source` | Channel (google, meta, tiktok, linkedin, bing) |
-| `campaign_name` | Campaign identifier |
-| `campaign_objective` | Awareness / Consideration / Conversion |
-| `cost_brl` | Media spend in BRL |
-| `impressions` | Total impressions |
-| `clicks` | Total clicks |
-| `ga4_transactions` | Attributed transactions (GA4) |
-| `ga4_transaction_value_brl` | Attributed revenue in BRL (GA4) |
+| `account_id` | Account identifier |
+| `plan_tier` | Subscription tier (Free / Pro / Enterprise) |
+| `mrr_brl` | Monthly recurring revenue in BRL |
+| `active_users` | Daily active users for the account |
+| `product_events` | Count of product usage events |
+| `support_tickets_opened` | Tickets opened |
+| `support_tickets_resolved` | Tickets resolved |
 
 ## Examples
 
@@ -97,23 +96,21 @@ Illustrative snippets, written for this project with synthetic/generic names —
 config {
   type: "incremental",
   schema: "silver",
-  name: "slv_channel_campaign_daily",
+  name: "slv_account_billing_daily",
   bigquery: {
     partitionBy: "date",
-    labels: { layer: "silver", channel: "channel_name", agent_readable: "true", domain: "marketing" }
+    labels: { layer: "silver", source_system: "billing", agent_readable: "true", domain: "account" }
   },
-  uniqueKey: ["date", "campaign_id"]
+  uniqueKey: ["date", "account_id"]
 }
 
 SELECT
   DATE(event_date) AS date,
-  campaign_id,
-  campaign_name,
-  SAFE_DIVIDE(cost_micros, 1e6) AS cost_brl,   -- BigQuery Native connectors report cost in micros
-  impressions,
-  clicks
-FROM ${ref("bronze_channel_raw")}
-WHERE DATE(event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)  -- lookback window, see Key Design Decisions
+  account_id,
+  plan_tier,
+  mrr_brl
+FROM ${ref("bronze_billing_raw")}
+WHERE DATE(event_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)  -- lookback window, see Key Decisions
 ${when(incremental(), `AND date >= (SELECT MAX(date) FROM ${self()})`)}
 ```
 
@@ -122,12 +119,12 @@ ${when(incremental(), `AND date >= (SELECT MAX(date) FROM ${self()})`)}
 ```sqlx
 config {
   type: "assertion",
-  name: "assert_no_duplicate_campaign_days"
+  name: "assert_no_duplicate_account_days"
 }
 
-SELECT date, campaign_id, COUNT(*) AS row_count
-FROM ${ref("slv_channel_campaign_daily")}
-GROUP BY date, campaign_id
+SELECT date, account_id, COUNT(*) AS row_count
+FROM ${ref("slv_account_billing_daily")}
+GROUP BY date, account_id
 HAVING COUNT(*) > 1
 ```
 
@@ -136,15 +133,15 @@ An assertion that returns zero rows passes silently. Any row returned fails the 
 **Grounding contract — the label that gates agent access**
 
 ```javascript
-// definitions/03_gold/marketing/gld_marketing_performance_daily.sqlx (config block)
+// definitions/03_gold/account/gld_account_activity_daily.sqlx (config block)
 config {
   type: "table",
   bigquery: {
     labels: {
       layer: "gold",
       agent_readable: "true",
-      pipeline: "marketing_unified",
-      domain: "marketing"
+      pipeline: "account_activity",
+      domain: "account"
     }
   }
 }
@@ -170,19 +167,9 @@ Assertions run automatically on every Dataform execution and block deployment on
 
 - **Transformation:** Dataform (SQLX)
 - **Warehouse:** Google BigQuery
-- **Ingestion:** BigQuery Native Connectors · Airbyte
+- **Ingestion:** BigQuery native connectors · a managed ELT connector (for sources with native support) · a custom Python connector on Cloud Run + Cloud Scheduler (for sources neither managed path covered — see Key Decisions)
 - **Orchestration:** Dataform Schedules · Cloud Workflows
-- **Language:** SQL · JavaScript (Dataform config)
-
-## Adding a New Channel
-
-1. Confirm raw dataset exists in BigQuery
-2. Add vars to `workflow_settings.yaml`
-3. Create Silver models in `definitions/02_silver/<channel>/`
-4. Create Gold models in `definitions/03_gold/<channel>/`
-5. Add assertions in `definitions/assertions/`
-6. Add `UNION ALL` to `gld_marketing_performance_daily`
-7. Set BigQuery labels on new datasets
+- **Language:** SQL · JavaScript (Dataform config) · Python (custom connector)
 
 ## Related Projects
 

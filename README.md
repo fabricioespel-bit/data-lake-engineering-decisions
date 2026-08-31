@@ -2,10 +2,6 @@
 
 A personal project exploring the medallion architecture pattern (Bronze/Silver/Gold), applied to a marketing analytics use case on **Google BigQuery** and **Dataform**, with an eye toward making the Gold layer safely consumable by AI agents. Uses a synthetic dataset, not any employer's or client's real data or pipelines.
 
-![Reference architecture: data sources through ingestion, medallion data lake, semantic layer, multi-agent system, MCP server, and consumption](docs/images/architecture-overview.png)
-
-*This repo covers ingestion → the medallion lake. The diagram also shows a semantic layer, multi-agent system and MCP server — related patterns explored separately in [multi-agent-analytics](https://github.com/fabricioespel-bit/multi-agent-analytics) and [mcp-server-template](https://github.com/fabricioespel-bit/mcp-server-template), built as independent projects, not as one connected production system.*
-
 ## Architecture
 
 ```
